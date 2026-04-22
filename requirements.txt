@@ -1,0 +1,3 @@
+aiogram==3.27.0
+maxapi-python==1.2.5
+python-dotenv==1.2.2
