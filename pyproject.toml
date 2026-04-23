@@ -1,7 +1,7 @@
 [project]
 name = "maxbridge"
 version = "0.1.0"
-distribution = true
+distribution = "wheel"
 description = "Bridge between MAX and Telegram chats"
 requires-python = ">=3.13"
 dependencies = [
