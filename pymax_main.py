@@ -53,9 +53,7 @@ class BridgeMaxClient(MaxClient):
 
 PHONE = os.getenv("PHONE")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FORWARD_TG_TO_MAX_GLOBAL = (os.getenv("FORWARD_TG_TO_MAX") or "").strip().lower() in ("true", "1", "yes")
-FORWARD_TG_TO_MAX_CHATS_RAW = os.getenv("FORWARD_TG_TO_MAX_CHATS") or os.getenv("TG_TO_MAX_CHATS")
-CHATS_JSON = os.getenv("CHATS")
+CHATS_RAW = os.getenv("CHATS")
 
 if not PHONE:
     raise RuntimeError("В .env не задан PHONE")
@@ -63,99 +61,79 @@ if not BOT_TOKEN:
     raise RuntimeError("В .env не задан BOT_TOKEN")
 
 
-def parse_chats_config(
-    chats_val: str | None,
-    forward_global: bool,
-    forward_chats_val: str | None,
-) -> tuple[dict[int, int], dict[int, int], set[int], bool]:
-    if not chats_val:
+def parse_chats(value: str | None) -> tuple[dict[int, int], dict[int, int], set[int]]:
+    if not value:
         raise RuntimeError("В .env не задан CHATS")
 
     try:
-        raw_chats = json.loads(chats_val)
+        raw = json.loads(value)
     except json.JSONDecodeError as error:
-        raise RuntimeError("В .env CHATS должен быть JSON-объектом") from error
-
-    if not isinstance(raw_chats, dict) or not raw_chats:
-        raise RuntimeError("В .env CHATS должен быть непустым JSON-объектом")
+        raise RuntimeError("В .env CHATS должен быть валидным JSON (список или объект)") from error
 
     chats: dict[int, int] = {}
-    tg_to_max_enabled: set[int] = set()
+    tg_to_max: set[int] = set()
 
-    for max_id_raw, val in raw_chats.items():
+    def process_item(max_val: Any, tg_val: Any, tg2max_val: Any) -> None:
         try:
-            max_id = int(max_id_raw)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError(f"Некорректный MAX chat_id: {max_id_raw}") from error
+            max_id = int(max_val)
+        except (TypeError, ValueError) as err:
+            raise RuntimeError(f"Некорректный max id: {max_val}") from err
+        try:
+            tg_id = int(tg_val)
+        except (TypeError, ValueError) as err:
+            raise RuntimeError(f"Некорректный tg id: {tg_val}") from err
 
-        if isinstance(val, dict):
-            tg_id_raw = val.get("telegram_id") if "telegram_id" in val else val.get("tg_id")
-            if tg_id_raw is None:
-                raise RuntimeError(f"В CHATS для {max_id_raw} не указан telegram_id / tg_id")
-            try:
-                tg_id = int(tg_id_raw)
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(f"Некорректный Telegram chat_id для {max_id_raw}: {tg_id_raw}") from error
-
-            if val.get("forward_tg_to_max") or val.get("forward_to_max"):
-                tg_to_max_enabled.add(tg_id)
-        elif isinstance(val, (list, tuple)) and len(val) >= 1:
-            try:
-                tg_id = int(val[0])
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(f"Некорректный Telegram chat_id для {max_id_raw}: {val[0]}") from error
-            if len(val) >= 2 and bool(val[1]):
-                tg_to_max_enabled.add(tg_id)
-        else:
-            try:
-                tg_id = int(val)
-            except (TypeError, ValueError) as error:
-                raise RuntimeError(f"В .env CHATS элемент для {max_id_raw} должен быть ID или объектом: {val}") from error
+        is_tg2max = False
+        if isinstance(tg2max_val, bool):
+            is_tg2max = tg2max_val
+        elif isinstance(tg2max_val, (int, float)):
+            is_tg2max = bool(tg2max_val)
+        elif isinstance(tg2max_val, str):
+            is_tg2max = tg2max_val.strip().lower() in ("true", "1", "yes")
 
         chats[max_id] = tg_id
+        if is_tg2max:
+            tg_to_max.add(tg_id)
 
-    chats_tg: dict[int, int] = {tg_id: max_id for max_id, tg_id in chats.items()}
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                raise RuntimeError(f"Элемент CHATS должен быть объектом {{max, tg, tg2max}}: {item}")
+            max_val = item.get("max") or item.get("max_id")
+            tg_val = item.get("tg") or item.get("tg_id") or item.get("telegram_id")
+            tg2max_val = item.get("tg2max", item.get("forward_tg_to_max", False))
+            if max_val is None or tg_val is None:
+                raise RuntimeError(f"В объекте чата должны быть поля max и tg: {item}")
+            process_item(max_val, tg_val, tg2max_val)
 
-    # Parse explicit FORWARD_TG_TO_MAX_CHATS list if provided
-    if forward_chats_val:
-        try:
-            parsed = json.loads(forward_chats_val)
-            if isinstance(parsed, (int, str)):
-                parsed = [parsed]
-        except json.JSONDecodeError:
-            parsed = [x.strip() for x in forward_chats_val.split(",") if x.strip()]
+    elif isinstance(raw, dict):
+        if "max" in raw and "tg" in raw:
+            process_item(raw["max"], raw["tg"], raw.get("tg2max", False))
+        else:
+            for max_key, val in raw.items():
+                if isinstance(val, dict):
+                    tg_val = val.get("tg") or val.get("tg_id") or val.get("telegram_id")
+                    if tg_val is None:
+                        raise RuntimeError(f"В настройках чата {max_key} не указан tg: {val}")
+                    tg2max_val = val.get("tg2max", val.get("forward_tg_to_max", False))
+                    process_item(max_key, tg_val, tg2max_val)
+                elif isinstance(val, (list, tuple)) and len(val) >= 1:
+                    tg_val = val[0]
+                    tg2max_val = val[1] if len(val) > 1 else False
+                    process_item(max_key, tg_val, tg2max_val)
+                else:
+                    process_item(max_key, val, False)
+    else:
+        raise RuntimeError("CHATS должен быть JSON-списком или JSON-объектом")
 
-        for item in parsed:
-            try:
-                cid = int(item)
-            except (TypeError, ValueError):
-                logger.warning("Пропущен некорректный ID чата в FORWARD_TG_TO_MAX_CHATS: %r", item)
-                continue
+    if not chats:
+        raise RuntimeError("CHATS не содержит ни одного чата")
 
-            if cid in chats_tg:
-                tg_to_max_enabled.add(cid)
-            elif cid in chats:
-                tg_to_max_enabled.add(chats[cid])
-            else:
-                tg_to_max_enabled.add(cid)
-
-    return chats, chats_tg, tg_to_max_enabled, forward_global
-
-
-CHATS, CHATS_TELEGRAM, FORWARD_TG_TO_MAX_CHATS, FORWARD_TG_TO_MAX_ALL = parse_chats_config(
-    CHATS_JSON,
-    FORWARD_TG_TO_MAX_GLOBAL,
-    FORWARD_TG_TO_MAX_CHATS_RAW,
-)
+    chats_tg = {tg_id: max_id for max_id, tg_id in chats.items()}
+    return chats, chats_tg, tg_to_max
 
 
-def is_tg_to_max_enabled(tg_chat_id: int) -> bool:
-    if tg_chat_id in FORWARD_TG_TO_MAX_CHATS:
-        return True
-    if FORWARD_TG_TO_MAX_ALL:
-        return True
-    return False
-
+CHATS, CHATS_TELEGRAM, TG_TO_MAX_CHATS = parse_chats(CHATS_RAW)
 
 MAX_HEADERS = UserAgentPayload(
     device_type="WEB",
@@ -416,7 +394,7 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
     if max_id is None:
         return
 
-    if not is_tg_to_max_enabled(message.chat.id):
+    if message.chat.id not in TG_TO_MAX_CHATS:
         return
 
     if message.from_user is None:
@@ -444,12 +422,12 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
 async def main() -> None:
     logger.info("Запуск maxbridge. Сконфигурировано связей чатов: %d", len(CHATS))
     for max_id, tg_id in CHATS.items():
-        tg_enabled = is_tg_to_max_enabled(tg_id)
+        tg2max = tg_id in TG_TO_MAX_CHATS
         logger.info(
-            "  • MAX %s <-> TG %s | MAX->TG: да | TG->MAX: %s",
+            "  • MAX %s <-> TG %s | MAX->TG: да | TG->MAX (tg2max): %s",
             max_id,
             tg_id,
-            "ДА" if tg_enabled else "нет",
+            "ДА" if tg2max else "нет",
         )
 
     telegram_task = asyncio.create_task(dp.start_polling(telegram_bot))
