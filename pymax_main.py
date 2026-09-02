@@ -53,7 +53,8 @@ class BridgeMaxClient(MaxClient):
 
 PHONE = os.getenv("PHONE")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FORWARD_TG_TO_MAX = os.getenv("FORWARD_TG_TO_MAX") == "true"
+FORWARD_TG_TO_MAX_GLOBAL = (os.getenv("FORWARD_TG_TO_MAX") or "").strip().lower() in ("true", "1", "yes")
+FORWARD_TG_TO_MAX_CHATS_RAW = os.getenv("FORWARD_TG_TO_MAX_CHATS") or os.getenv("TG_TO_MAX_CHATS")
 CHATS_JSON = os.getenv("CHATS")
 
 if not PHONE:
@@ -62,27 +63,98 @@ if not BOT_TOKEN:
     raise RuntimeError("В .env не задан BOT_TOKEN")
 
 
-def parse_chats(value: str | None) -> dict[int, int]:
-    if not value:
+def parse_chats_config(
+    chats_val: str | None,
+    forward_global: bool,
+    forward_chats_val: str | None,
+) -> tuple[dict[int, int], dict[int, int], set[int], bool]:
+    if not chats_val:
         raise RuntimeError("В .env не задан CHATS")
 
     try:
-        raw_chats = json.loads(value)
+        raw_chats = json.loads(chats_val)
     except json.JSONDecodeError as error:
         raise RuntimeError("В .env CHATS должен быть JSON-объектом") from error
 
     if not isinstance(raw_chats, dict) or not raw_chats:
         raise RuntimeError("В .env CHATS должен быть непустым JSON-объектом")
 
-    try:
-        return {int(max_id): int(telegram_id) for max_id, telegram_id in raw_chats.items()}
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("В .env CHATS должен быть формата {\"max_chat_id\": telegram_chat_id}") from error
+    chats: dict[int, int] = {}
+    tg_to_max_enabled: set[int] = set()
+
+    for max_id_raw, val in raw_chats.items():
+        try:
+            max_id = int(max_id_raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"Некорректный MAX chat_id: {max_id_raw}") from error
+
+        if isinstance(val, dict):
+            tg_id_raw = val.get("telegram_id") if "telegram_id" in val else val.get("tg_id")
+            if tg_id_raw is None:
+                raise RuntimeError(f"В CHATS для {max_id_raw} не указан telegram_id / tg_id")
+            try:
+                tg_id = int(tg_id_raw)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"Некорректный Telegram chat_id для {max_id_raw}: {tg_id_raw}") from error
+
+            if val.get("forward_tg_to_max") or val.get("forward_to_max"):
+                tg_to_max_enabled.add(tg_id)
+        elif isinstance(val, (list, tuple)) and len(val) >= 1:
+            try:
+                tg_id = int(val[0])
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"Некорректный Telegram chat_id для {max_id_raw}: {val[0]}") from error
+            if len(val) >= 2 and bool(val[1]):
+                tg_to_max_enabled.add(tg_id)
+        else:
+            try:
+                tg_id = int(val)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"В .env CHATS элемент для {max_id_raw} должен быть ID или объектом: {val}") from error
+
+        chats[max_id] = tg_id
+
+    chats_tg: dict[int, int] = {tg_id: max_id for max_id, tg_id in chats.items()}
+
+    # Parse explicit FORWARD_TG_TO_MAX_CHATS list if provided
+    if forward_chats_val:
+        try:
+            parsed = json.loads(forward_chats_val)
+            if isinstance(parsed, (int, str)):
+                parsed = [parsed]
+        except json.JSONDecodeError:
+            parsed = [x.strip() for x in forward_chats_val.split(",") if x.strip()]
+
+        for item in parsed:
+            try:
+                cid = int(item)
+            except (TypeError, ValueError):
+                logger.warning("Пропущен некорректный ID чата в FORWARD_TG_TO_MAX_CHATS: %r", item)
+                continue
+
+            if cid in chats_tg:
+                tg_to_max_enabled.add(cid)
+            elif cid in chats:
+                tg_to_max_enabled.add(chats[cid])
+            else:
+                tg_to_max_enabled.add(cid)
+
+    return chats, chats_tg, tg_to_max_enabled, forward_global
 
 
-CHATS = parse_chats(CHATS_JSON)
+CHATS, CHATS_TELEGRAM, FORWARD_TG_TO_MAX_CHATS, FORWARD_TG_TO_MAX_ALL = parse_chats_config(
+    CHATS_JSON,
+    FORWARD_TG_TO_MAX_GLOBAL,
+    FORWARD_TG_TO_MAX_CHATS_RAW,
+)
 
-CHATS_TELEGRAM = {telegram_id: max_id for max_id, telegram_id in CHATS.items()}
+
+def is_tg_to_max_enabled(tg_chat_id: int) -> bool:
+    if tg_chat_id in FORWARD_TG_TO_MAX_CHATS:
+        return True
+    if FORWARD_TG_TO_MAX_ALL:
+        return True
+    return False
 
 
 MAX_HEADERS = UserAgentPayload(
@@ -340,22 +412,24 @@ async def send_telegram_attachment_to_max(
 
 @dp.message()
 async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
-    if not FORWARD_TG_TO_MAX:
-        return
-
     max_id = CHATS_TELEGRAM.get(message.chat.id)
     if max_id is None:
+        return
+
+    if not is_tg_to_max_enabled(message.chat.id):
         return
 
     if message.from_user is None:
         return
 
-    member = await bot.get_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
-    custom_title = getattr(member, "custom_title", None)
-    if custom_title:
-        signature = f"{member.user.first_name} ({custom_title})"
-    else:
-        signature = message.from_user.first_name
+    signature = message.from_user.first_name
+    try:
+        member = await bot.get_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
+        custom_title = getattr(member, "custom_title", None)
+        if custom_title:
+            signature = f"{member.user.first_name} ({custom_title})"
+    except Exception:
+        pass
 
     text = build_text(signature, message.text or message.caption)
 
@@ -368,6 +442,16 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
 
 
 async def main() -> None:
+    logger.info("Запуск maxbridge. Сконфигурировано связей чатов: %d", len(CHATS))
+    for max_id, tg_id in CHATS.items():
+        tg_enabled = is_tg_to_max_enabled(tg_id)
+        logger.info(
+            "  • MAX %s <-> TG %s | MAX->TG: да | TG->MAX: %s",
+            max_id,
+            tg_id,
+            "ДА" if tg_enabled else "нет",
+        )
+
     telegram_task = asyncio.create_task(dp.start_polling(telegram_bot))
 
     try:
