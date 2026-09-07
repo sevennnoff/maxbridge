@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from dotenv import load_dotenv
 from pymax import MaxClient, Message
 from pymax.files import File, Photo, Video
@@ -19,6 +21,8 @@ from pymax.types import FileAttach, PhotoAttach, VideoAttach
 
 
 load_dotenv(override=True)
+
+START_TIME = time.time()
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -150,6 +154,22 @@ telegram_bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+def format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}д")
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+    parts.append(f"{seconds}с")
+    return " ".join(parts)
+
+
 def build_author_name(user: object | None, fallback: str = "MAX") -> str:
     names = getattr(user, "names", None) or []
     if names:
@@ -159,8 +179,11 @@ def build_author_name(user: object | None, fallback: str = "MAX") -> str:
     return fallback
 
 
-def build_text(author: str, text: str | None) -> str:
+def build_text(author: str, text: str | None, reply_header: str = "") -> str:
     text = (text or "").strip()
+    if reply_header:
+        body = (reply_header + "\n" + text).strip() if text else reply_header.strip()
+        return f"{author}:\n{body}"
     return f"{author}: {text}" if text else f"{author}:"
 
 
@@ -177,21 +200,8 @@ async def author_name_from_sender(sender: int | None, fallback: str = "MAX") -> 
     return build_author_name(user, fallback)
 
 
-async def resolve_linked_message(message: Message) -> tuple[Message, int | None]:
-    current = message
-    source_chat_id = message.chat_id
-
-    for _ in range(20):
-        if current.link is None or current.link.message is None:
-            break
-        source_chat_id = current.link.chat_id or source_chat_id
-        current = current.link.message
-
-    return current, source_chat_id
-
-
-def build_caption(author: str, text: str | None) -> str:
-    return build_text(author, text)[:1024]
+def build_caption(author: str, text: str | None, reply_header: str = "") -> str:
+    return build_text(author, text, reply_header)[:1024]
 
 
 def filename_from_response(response: aiohttp.ClientResponse, fallback: str) -> str:
@@ -303,18 +313,36 @@ async def handle_max_message(message: Message) -> None:
         if tg_id is None:
             return
 
-        max_message, source_chat_id = await resolve_linked_message(message)
-        max_chat_id = source_chat_id or incoming_chat_id
-
         author = await author_name_from_sender(message.sender)
-        caption = build_caption(author, max_message.text)
 
-        if max_message.attaches:
-            for attach in max_message.attaches:
+        reply_header = ""
+        if message.link and message.link.message:
+            linked_msg = message.link.message
+            reply_author = await author_name_from_sender(linked_msg.sender, fallback="сообщение")
+            raw_text = (linked_msg.text or "").strip().replace("\n", " ")
+            if raw_text:
+                preview = raw_text[:50] + ("..." if len(raw_text) > 50 else "")
+                reply_header = f"💬 В ответ на {reply_author}: «{preview}»"
+            else:
+                reply_header = f"💬 В ответ на {reply_author}"
+
+        target_message = message
+        # If current message is an empty wrapper around a forward (no text, no attaches of its own)
+        if not message.text and not message.attaches and message.link and message.link.message:
+            if message.link.message.attaches or message.link.message.text:
+                target_message = message.link.message
+                fwd_author = await author_name_from_sender(target_message.sender)
+                author = f"{author} (переслано от {fwd_author})"
+                reply_header = ""
+
+        caption = build_caption(author, target_message.text, reply_header)
+
+        if target_message.attaches:
+            for attach in target_message.attaches:
                 await send_max_attachment_to_telegram(
                     tg_id=tg_id,
-                    max_chat_id=max_chat_id,
-                    max_message=max_message,
+                    max_chat_id=incoming_chat_id,
+                    max_message=target_message,
                     attach=attach,
                     caption=caption,
                 )
@@ -322,7 +350,7 @@ async def handle_max_message(message: Message) -> None:
 
         await telegram_bot.send_message(
             chat_id=tg_id,
-            text=build_text(author, max_message.text),
+            text=build_text(author, target_message.text, reply_header),
         )
     except aiohttp.ClientError:
         logger.exception("Не удалось скачать вложение из MAX")
@@ -388,8 +416,53 @@ async def send_telegram_attachment_to_max(
     return False
 
 
+@dp.message(Command("status"))
+async def handle_status_command(message: types.Message) -> None:
+    current_tg_id = message.chat.id
+    linked_max_id = CHATS_TELEGRAM.get(current_tg_id)
+    tg2max_active = current_tg_id in TG_TO_MAX_CHATS
+
+    chat_title = message.chat.title or message.chat.full_name or message.chat.type
+
+    is_conn = getattr(client, "is_connected", False)
+    conn_status = "🟢 Подключен к MAX" if is_conn else "🔴 Не подключен к MAX"
+    uptime_str = format_uptime(time.time() - START_TIME)
+
+    lines = [
+        "📊 <b>Статус MaxBridge</b>",
+        "",
+        f"<b>Статус шлюза:</b> {conn_status}",
+        f"<b>Аптайм процесса:</b> <code>{uptime_str}</code>",
+        "",
+        "<b>📍 Текущий чат:</b>",
+        f"• Название: <i>{chat_title}</i>",
+        f"• TG ID: <code>{current_tg_id}</code>",
+    ]
+
+    if linked_max_id is not None:
+        lines.append(f"• MAX ID: <code>{linked_max_id}</code>")
+        lines.append("• MAX ➔ TG: ✅ Включено")
+        lines.append(f"• TG ➔ MAX: {'✅ Включено' if tg2max_active else '❌ Выключено'}")
+    else:
+        lines.append("• Связка: ⚠️ <i>Этот чат не настроен в CHATS</i>")
+
+    lines.append("")
+    lines.append(f"<b>⚙️ Всего настроено чатов:</b> {len(CHATS)}")
+
+    for idx, (max_id, tg_id) in enumerate(CHATS.items(), 1):
+        t2m = "✅" if tg_id in TG_TO_MAX_CHATS else "❌"
+        is_current = " (👉 этот чат)" if tg_id == current_tg_id else ""
+        lines.append(f"{idx}. MAX <code>{max_id}</code> ➔ TG <code>{tg_id}</code> [TG2MAX: {t2m}]{is_current}")
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message()
 async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
+    # Ignore bot commands
+    if message.text and message.text.startswith("/"):
+        return
+
     max_id = CHATS_TELEGRAM.get(message.chat.id)
     if max_id is None:
         return
