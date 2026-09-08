@@ -10,14 +10,20 @@ from typing import Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramEntityTooLarge
 from aiogram.filters import Command
 from dotenv import load_dotenv
 from pymax import MaxClient, Message
 from pymax.files import File, Photo, Video
 from pymax.formatter import ColoredFormatter
 from pymax.payloads import UserAgentPayload
-from pymax.types import FileAttach, PhotoAttach, VideoAttach
+from pymax.types import (
+    AudioAttach,
+    FileAttach,
+    PhotoAttach,
+    StickerAttach,
+    VideoAttach,
+)
 
 
 load_dotenv(override=True)
@@ -209,7 +215,7 @@ def filename_from_response(response: aiohttp.ClientResponse, fallback: str) -> s
 
 
 async def download_bytes(url: str, fallback_name: str) -> tuple[bytes, str]:
-    timeout = aiohttp.ClientTimeout(total=90, connect=20, sock_read=60)
+    timeout = aiohttp.ClientTimeout(total=120, connect=20, sock_read=90)
     last_error: BaseException | None = None
 
     for attempt in range(1, 4):
@@ -242,64 +248,125 @@ async def send_max_attachment_to_telegram(
     max_chat_id: int,
     max_message: Message,
     attach: object,
-    caption: str,
-) -> None:
-    if isinstance(attach, PhotoAttach):
-        photo_bytes, filename = await download_bytes(attach.base_url, "photo.jpg")
-        logger.info("Отправляю фото в Telegram: %s, %s байт", filename, len(photo_bytes))
-        try:
-            await telegram_bot.send_photo(
-                chat_id=tg_id,
-                caption=caption,
-                photo=types.BufferedInputFile(photo_bytes, filename=filename),
+    caption: str | None,
+) -> bool:
+    try:
+        if isinstance(attach, PhotoAttach):
+            photo_bytes, filename = await download_bytes(attach.base_url, "photo.jpg")
+            logger.info("Отправляю фото в Telegram: %s, %s байт", filename, len(photo_bytes))
+            try:
+                await telegram_bot.send_photo(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    photo=types.BufferedInputFile(photo_bytes, filename=filename),
+                )
+                logger.info("Фото отправлено в Telegram: %s", filename)
+            except TelegramBadRequest:
+                logger.exception("Telegram не принял файл как фото, отправляю документом: %s", filename)
+                await telegram_bot.send_document(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    document=types.BufferedInputFile(photo_bytes, filename=filename),
+                )
+                logger.info("Фото отправлено в Telegram документом: %s", filename)
+            return True
+
+        if isinstance(attach, VideoAttach):
+            video = await client.get_video_by_id(
+                chat_id=max_chat_id,
+                message_id=max_message.id,
+                video_id=attach.video_id,
             )
-            logger.info("Фото отправлено в Telegram: %s", filename)
-        except TelegramBadRequest:
-            logger.exception("Telegram не принял файл как фото, отправляю документом: %s", filename)
+            if video is None or not getattr(video, "url", None):
+                raise RuntimeError(f"MAX не вернул ссылку на видео {attach.video_id}")
+
+            video_bytes, filename = await download_bytes(video.url, "video.mp4")
+            logger.info("Отправляю видео в Telegram: %s, %s байт", filename, len(video_bytes))
+            try:
+                await telegram_bot.send_video(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    video=types.BufferedInputFile(video_bytes, filename=filename),
+                )
+                logger.info("Видео отправлено в Telegram: %s", filename)
+            except TelegramBadRequest:
+                logger.exception("Telegram не принял как видео, отправляю документом: %s", filename)
+                await telegram_bot.send_document(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    document=types.BufferedInputFile(video_bytes, filename=filename),
+                )
+            return True
+
+        if isinstance(attach, FileAttach):
+            file = await client.get_file_by_id(
+                chat_id=max_chat_id,
+                message_id=max_message.id,
+                file_id=attach.file_id,
+            )
+            if file is None or not getattr(file, "url", None):
+                raise RuntimeError(f"MAX не вернул ссылку на файл {attach.file_id}")
+
+            file_bytes, filename = await download_bytes(file.url, attach.name or "file")
+            logger.info("Отправляю документ в Telegram: %s, %s байт", filename, len(file_bytes))
             await telegram_bot.send_document(
                 chat_id=tg_id,
-                caption=caption,
-                document=types.BufferedInputFile(photo_bytes, filename=filename),
+                caption=caption or None,
+                document=types.BufferedInputFile(file_bytes, filename=filename),
             )
-            logger.info("Фото отправлено в Telegram документом: %s", filename)
-        return
+            logger.info("Документ отправлен в Telegram: %s", filename)
+            return True
 
-    if isinstance(attach, VideoAttach):
-        video = await client.get_video_by_id(
-            chat_id=max_chat_id,
-            message_id=max_message.id,
-            video_id=attach.video_id,
-        )
-        if video is None:
-            raise RuntimeError(f"MAX не вернул ссылку на видео {attach.video_id}")
+        if isinstance(attach, AudioAttach):
+            audio_bytes, filename = await download_bytes(attach.url, "voice.ogg")
+            try:
+                await telegram_bot.send_voice(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    voice=types.BufferedInputFile(audio_bytes, filename=filename),
+                )
+            except TelegramBadRequest:
+                await telegram_bot.send_audio(
+                    chat_id=tg_id,
+                    caption=caption or None,
+                    audio=types.BufferedInputFile(audio_bytes, filename=filename),
+                )
+            return True
 
-        video_bytes, filename = await download_bytes(video.url, "video.mp4")
-        logger.info("Отправляю видео в Telegram: %s, %s байт", filename, len(video_bytes))
-        await telegram_bot.send_video(
-            chat_id=tg_id,
-            caption=caption,
-            video=types.BufferedInputFile(video_bytes, filename=filename),
-        )
-        logger.info("Видео отправлено в Telegram: %s", filename)
-        return
+        if isinstance(attach, StickerAttach):
+            sticker_bytes, filename = await download_bytes(attach.url, "sticker.webp")
+            await telegram_bot.send_document(
+                chat_id=tg_id,
+                caption=caption or None,
+                document=types.BufferedInputFile(sticker_bytes, filename=filename),
+            )
+            return True
 
-    if isinstance(attach, FileAttach):
-        file = await client.get_file_by_id(
-            chat_id=max_chat_id,
-            message_id=max_message.id,
-            file_id=attach.file_id,
-        )
-        if file is None:
-            raise RuntimeError(f"MAX не вернул ссылку на файл {attach.file_id}")
+        logger.warning("Пропущен неизвестный тип вложения: %r", attach)
+        return False
 
-        file_bytes, filename = await download_bytes(file.url, attach.name or "file")
-        logger.info("Отправляю документ в Telegram: %s, %s байт", filename, len(file_bytes))
-        await telegram_bot.send_document(
-            chat_id=tg_id,
-            caption=caption,
-            document=types.BufferedInputFile(file_bytes, filename=filename),
-        )
-        logger.info("Документ отправлен в Telegram: %s", filename)
+    except (TelegramEntityTooLarge, TelegramBadRequest) as err:
+        logger.exception("Telegram отклонил вложение %r: %s", attach, err)
+        name = getattr(attach, "name", None) or getattr(attach, "file_id", "файл")
+        try:
+            await telegram_bot.send_message(
+                chat_id=tg_id,
+                text=f"⚠️ Не удалось отправить вложение из MAX в TG (слишком большой файл или неподдерживаемый формат): {name}",
+            )
+        except Exception:
+            pass
+        return False
+    except Exception as err:
+        logger.exception("Ошибка при обработке/отправке вложения %r: %s", attach, err)
+        name = getattr(attach, "name", None) or getattr(attach, "file_id", "файл")
+        try:
+            await telegram_bot.send_message(
+                chat_id=tg_id,
+                text=f"⚠️ Не удалось скачать/переслать вложение из MAX: {name}",
+            )
+        except Exception:
+            pass
+        return False
 
 
 @client.on_message()
@@ -338,13 +405,28 @@ async def handle_max_message(message: Message) -> None:
         caption = build_caption(author, target_message.text, reply_header)
 
         if target_message.attaches:
+            sent_any = False
+            first = True
             for attach in target_message.attaches:
-                await send_max_attachment_to_telegram(
+                current_caption = caption if first else None
+                success = await send_max_attachment_to_telegram(
                     tg_id=tg_id,
                     max_chat_id=incoming_chat_id,
                     max_message=target_message,
                     attach=attach,
-                    caption=caption,
+                    caption=current_caption,
+                )
+                if success:
+                    sent_any = True
+                    first = False
+                if len(target_message.attaches) > 1:
+                    await asyncio.sleep(0.3)
+
+            # If all attachments failed, but there is text/quote, send text message
+            if not sent_any and (target_message.text or reply_header):
+                await telegram_bot.send_message(
+                    chat_id=tg_id,
+                    text=build_text(author, target_message.text, reply_header),
                 )
             return
 
