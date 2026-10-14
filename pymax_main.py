@@ -177,6 +177,13 @@ def format_uptime(seconds: float) -> str:
     return " ".join(parts)
 
 
+def format_preview(text: str | None, max_len: int = 60) -> str:
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) > max_len:
+        return cleaned[:max_len].rstrip() + "..."
+    return cleaned
+
+
 def build_author_name(user: object | None, fallback: str = "MAX") -> str:
     names = getattr(user, "names", None) or []
     if names:
@@ -428,6 +435,28 @@ async def send_max_attachment_to_telegram(
         return False
 
 
+async def try_send_media_group(
+    tg_id: int,
+    media_items: list[tuple[str, bytes, str]],  # (kind, data, filename)
+    caption: str | None,
+) -> bool:
+    try:
+        group: list[types.InputMediaPhoto | types.InputMediaVideo] = []
+        for idx, (kind, data, filename) in enumerate(media_items):
+            file_obj = types.BufferedInputFile(data, filename=filename)
+            item_caption = caption if idx == 0 else None
+            if kind == "photo":
+                group.append(types.InputMediaPhoto(media=file_obj, caption=item_caption))
+            elif kind == "video":
+                group.append(types.InputMediaVideo(media=file_obj, caption=item_caption))
+        if group:
+            await telegram_bot.send_media_group(chat_id=tg_id, media=group)
+            return True
+    except Exception:
+        logger.exception("Не удалось отправить media group в Telegram")
+    return False
+
+
 @client.on_message()
 async def handle_max_message(message: Message) -> None:
     try:
@@ -441,8 +470,6 @@ async def handle_max_message(message: Message) -> None:
 
         author = await author_name_from_sender(message.sender)
 
-        # Collect all attachments and determine candidate chat_id, message_id
-        # items_to_send: list of (attach, candidates)
         items_to_send: list[tuple[Any, list[tuple[int, int]]]] = []
 
         # 1. Direct attachments on root message
@@ -462,8 +489,6 @@ async def handle_max_message(message: Message) -> None:
             l_chat_id = curr_link.chat_id
             link_type = (curr_link.type or "").upper()
 
-            # Candidates for downloading any attach from this linked message
-            # Current chat message.id ALWAYS first because the bot is guaranteed to have rights in incoming_chat_id!
             att_candidates = [
                 (incoming_chat_id, message.id),
                 (l_chat_id, l_msg.id) if l_chat_id and l_msg.id else None,
@@ -472,7 +497,6 @@ async def handle_max_message(message: Message) -> None:
             ]
             valid_candidates = [c for c in att_candidates if c is not None]
 
-            # Decide whether to collect attachments from this linked message
             is_explicit_reply = "REPLY" in link_type
             has_own_content = bool(message.text and message.text.strip()) or bool(message.attaches)
 
@@ -487,13 +511,14 @@ async def handle_max_message(message: Message) -> None:
             # Header formatting
             if is_explicit_reply and depth == 1 and has_own_content:
                 reply_author = await author_name_from_sender(l_msg.sender, fallback="сообщение")
-                raw_text = (l_msg.text or "").strip().replace("\n", " ")
-                if raw_text:
-                    preview = raw_text[:50] + ("..." if len(raw_text) > 50 else "")
+                # Clean and collapse multi-line/nested text into a short preview (max 60 chars)
+                preview = format_preview(l_msg.text, max_len=60)
+                if preview:
                     reply_header = f"💬 В ответ на {reply_author}: «{preview}»"
                 else:
                     reply_header = f"💬 В ответ на {reply_author}"
-            else:
+            elif not is_explicit_reply:
+                # Only include forward_info if this is an actual forward, NOT a reply
                 fwd_author = await author_name_from_sender(l_msg.sender, fallback="сообщение")
                 l_text = (l_msg.text or "").strip()
                 if not forward_info:
@@ -516,10 +541,31 @@ async def handle_max_message(message: Message) -> None:
         caption = build_caption(author, final_content, reply_header)
 
         if items_to_send:
+            # If all attachments are photos/videos (between 2 and 10), attempt to group them as an album
+            all_media = all(isinstance(att, (PhotoAttach, VideoAttach)) for att, _ in items_to_send)
+            if all_media and 2 <= len(items_to_send) <= 10:
+                try:
+                    downloaded_media: list[tuple[str, bytes, str]] = []
+                    for att, cand in items_to_send:
+                        if isinstance(att, PhotoAttach):
+                            p_bytes, f_name = await download_bytes(att.base_url, "photo.jpg")
+                            downloaded_media.append(("photo", p_bytes, urllib.parse.unquote(f_name)))
+                        elif isinstance(att, VideoAttach):
+                            v_obj = await fetch_video_download_url(client, cand, att.video_id)
+                            v_bytes, f_name = await download_bytes(v_obj.url, "video.mp4")
+                            downloaded_media.append(("video", v_bytes, urllib.parse.unquote(f_name)))
+                    
+                    album_ok = await try_send_media_group(tg_id, downloaded_media, caption)
+                    if album_ok:
+                        return
+                except Exception:
+                    logger.exception("Media group download/send failed, fallback to sequential sending")
+
+            # Sequential sending
+            sent_caption = False
             sent_any = False
-            first = True
             for attach, candidates in items_to_send:
-                current_caption = caption if first else None
+                current_caption = caption if not sent_caption else None
                 success = await send_max_attachment_to_telegram(
                     tg_id=tg_id,
                     candidates=candidates,
@@ -528,12 +574,13 @@ async def handle_max_message(message: Message) -> None:
                 )
                 if success:
                     sent_any = True
-                    first = False
+                    if current_caption:
+                        sent_caption = True
                 if len(items_to_send) > 1:
                     await asyncio.sleep(0.3)
 
-            # If all attachments failed, but there is text/quote, send text message
-            if not sent_any and (final_content or reply_header):
+            # If attachments were sent but NONE of them could take the caption (or all attachments failed), send text separately
+            if not sent_caption and (final_content or reply_header):
                 await telegram_bot.send_message(
                     chat_id=tg_id,
                     text=build_text(author, final_content, reply_header),
