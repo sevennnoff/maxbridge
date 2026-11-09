@@ -11,3 +11,7 @@ cache/
 *.log
 
 .vscode
+qr_link.txt
+qr_status.txt
+qr.png
+qr_login.log
