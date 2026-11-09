@@ -50,8 +50,14 @@ DOWNLOAD_HEADERS = {
     "Accept": "*/*",
 }
 
+MAX_RECONNECT_MIN_DELAY = 5.0
+MAX_RECONNECT_MAX_DELAY = 300.0
+MAX_RECONNECT_STABLE_SECONDS = 60.0
+
 
 class BridgeMaxClient(MaxClient):
+    token_invalid: bool = False
+
     async def _send_notification_response(self, chat_id: int, message_id: str) -> None:
         logger.debug("Skip MAX message ACK: chat_id=%s message_id=%s", chat_id, message_id)
 
@@ -60,6 +66,15 @@ class BridgeMaxClient(MaxClient):
             await super()._handle_message_notifications(data)
         except Exception:
             logger.exception("PyMax не смог обработать входящее MAX-сообщение: %r", data)
+
+    async def _sync(self, user_agent: Any = None) -> None:
+        try:
+            await super()._sync(user_agent)
+        except Exception as error:
+            text = str(error)
+            if "FAIL_LOGIN_TOKEN" in text or "login.token" in text:
+                self.token_invalid = True
+            raise
 
 
 PHONE = os.getenv("PHONE")
@@ -155,7 +170,13 @@ MAX_HEADERS = UserAgentPayload(
     timezone="Europe/Moscow",
 )
 
-client = BridgeMaxClient(phone=PHONE, work_dir="cache", headers=MAX_HEADERS, reconnect=True)
+client = BridgeMaxClient(
+    phone=PHONE,
+    work_dir="cache",
+    headers=MAX_HEADERS,
+    reconnect=False,
+    reconnect_delay=MAX_RECONNECT_MIN_DELAY,
+)
 client.logger.propagate = False
 telegram_bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -731,6 +752,34 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
         logger.exception("Не удалось переслать сообщение из Telegram в MAX")
 
 
+async def run_max_client_forever() -> None:
+    delay = MAX_RECONNECT_MIN_DELAY
+
+    while not client.token_invalid:
+        attempt_started = time.monotonic()
+        try:
+            await client.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MAX клиент упал с неожиданной ошибкой")
+
+        if client.token_invalid:
+            logger.critical(
+                "Токен MAX недействителен (FAIL_LOGIN_TOKEN). "
+                "Автопереподключение остановлено — требуется повторная авторизация."
+            )
+            break
+
+        uptime = time.monotonic() - attempt_started
+        if uptime >= MAX_RECONNECT_STABLE_SECONDS:
+            delay = MAX_RECONNECT_MIN_DELAY
+
+        logger.warning("MAX отключен (сессия жила %.0f c). Переподключение через %.0f c", uptime, delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, MAX_RECONNECT_MAX_DELAY)
+
+
 async def main() -> None:
     logger.info("Запуск maxbridge. Сконфигурировано связей чатов: %d", len(CHATS))
     for max_id, tg_id in CHATS.items():
@@ -745,7 +794,7 @@ async def main() -> None:
     telegram_task = asyncio.create_task(dp.start_polling(telegram_bot))
 
     try:
-        await client.start()
+        await run_max_client_forever()
     finally:
         telegram_task.cancel()
         await client.close()
