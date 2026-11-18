@@ -18,6 +18,7 @@ from pymax import MaxClient, Message
 from pymax.files import File, Photo, Video
 from pymax.formatter import ColoredFormatter
 from pymax.payloads import UserAgentPayload
+from max_transport import BridgeTransportClient
 from pymax.types import (
     AudioAttach,
     FileAttach,
@@ -55,7 +56,7 @@ MAX_RECONNECT_MAX_DELAY = 300.0
 MAX_RECONNECT_STABLE_SECONDS = 60.0
 
 
-class BridgeMaxClient(MaxClient):
+class BridgeMaxClient(BridgeTransportClient):
     token_invalid: bool = False
 
     async def _send_notification_response(self, chat_id: int, message_id: str) -> None:

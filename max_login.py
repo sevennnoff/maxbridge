@@ -19,7 +19,8 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv(BASE_DIR / ".env", override=True)
 
 from pymax import MaxClient  # noqa: E402
-from pymax.payloads import UserAgentPayload  # noqa: E402
+from pymax.payloads import UserAgentPayload
+from max_transport import BridgeTransportClient  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("maxbridge-login")
@@ -92,7 +93,7 @@ async def poll_once(client: MaxClient) -> bool:
 async def main() -> None:
     write_status("STARTING")
     max_ws_uri = os.getenv("MAX_WS_URI", "").strip()
-    client = MaxClient(
+    client = BridgeTransportClient(
         **({"uri": max_ws_uri} if max_ws_uri else {}),
         phone=os.getenv("PHONE"),
         work_dir=str(BASE_DIR / "cache"),
