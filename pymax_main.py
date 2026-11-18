@@ -170,7 +170,10 @@ MAX_HEADERS = UserAgentPayload(
     timezone="Europe/Moscow",
 )
 
+max_ws_uri = os.getenv("MAX_WS_URI", "").strip()
+
 client = BridgeMaxClient(
+    **({"uri": max_ws_uri} if max_ws_uri else {}),
     phone=PHONE,
     work_dir="cache",
     headers=MAX_HEADERS,

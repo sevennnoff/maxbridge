@@ -91,7 +91,9 @@ async def poll_once(client: MaxClient) -> bool:
 
 async def main() -> None:
     write_status("STARTING")
+    max_ws_uri = os.getenv("MAX_WS_URI", "").strip()
     client = MaxClient(
+        **({"uri": max_ws_uri} if max_ws_uri else {}),
         phone=os.getenv("PHONE"),
         work_dir=str(BASE_DIR / "cache"),
         headers=UA,
