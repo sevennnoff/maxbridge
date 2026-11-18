@@ -56,6 +56,12 @@ class BinaryWebSocket:
 
 
 class BridgeTransportClient(MaxClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        version = os.getenv('MAX_APP_VERSION', '').strip()
+        if version:
+            self.user_agent = self.user_agent.model_copy(update={'app_version': version})
+
     def _make_message(self, opcode, payload, cmd=0):
         if isinstance(self._ws, BinaryWebSocket):
             while True:
