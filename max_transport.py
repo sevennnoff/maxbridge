@@ -5,7 +5,7 @@ import struct
 import lz4.block
 import msgpack
 import zstandard
-from pymax import MaxClient
+from pymax import MaxClient, Opcode
 
 HEADER = struct.Struct('>BBHHI')
 MAX_PAYLOAD = 10 * 1024 * 1024
@@ -64,6 +64,8 @@ class BridgeTransportClient(MaxClient):
 
     def _make_message(self, opcode, payload, cmd=0):
         if isinstance(self._ws, BinaryWebSocket):
+            if opcode in (Opcode.FILE_DOWNLOAD, Opcode.VIDEO_PLAY):
+                payload = {**payload, "messageId": int(payload["messageId"])}
             while True:
                 self._seq %= 65535
                 if self._seq + 1 not in self._pending:
