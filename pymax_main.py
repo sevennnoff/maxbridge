@@ -21,6 +21,7 @@ from pymax.formatter import ColoredFormatter
 from pymax.payloads import UserAgentPayload
 from max_transport import BridgeTransportClient
 from message_edits import Delivery, ForwardStore
+from telegram_retry import retry_chat_request
 from pymax.types import (
     AudioAttach,
     FileAttach,
@@ -185,6 +186,7 @@ client = BridgeMaxClient(
 )
 client.logger.propagate = False
 telegram_bot = Bot(token=BOT_TOKEN)
+telegram_bot.session.middleware(retry_chat_request)
 dp = Dispatcher()
 forward_store = ForwardStore(Path("cache/forwarded.sqlite3"))
 message_locks = tuple(asyncio.Lock() for _ in range(128))
